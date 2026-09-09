@@ -33,8 +33,9 @@ existing bike list in column A untouched and only fills in B/C per bike.
 """
 
 import io
+import json
 import os
-from datetime import date, datetime, timedelta
+from datetime import date
 
 import pandas as pd
 import requests
@@ -187,11 +188,20 @@ def metabase_session() -> dict:
 
 
 def fetch_metabase_csv_with_params(card_id: int, parameters: list) -> pd.DataFrame:
+    """
+    Metabase's /query/csv endpoint takes `parameters` as a JSON-encoded
+    STRING in a form-encoded body — not a JSON object body. Sending it
+    as JSON (the natural-looking way) is silently accepted but the
+    parameters never reach the query, so template tags with no default
+    either come through unfiltered (optional tags) or fail with
+    "missing required parameters" (required tags, like start_date/
+    end_date on the QC FLOW DATA card).
+    """
     headers = metabase_session()
 
     csv_resp = requests.post(
         f"{METABASE_URL}/api/card/{card_id}/query/csv",
-        json={"parameters": parameters},
+        data={"parameters": json.dumps(parameters)},
         headers=headers,
         timeout=180,
     )
