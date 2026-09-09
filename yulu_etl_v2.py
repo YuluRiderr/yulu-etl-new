@@ -1,5 +1,5 @@
 """
-Yulu ETL v2 — Sweep_Raw / Bikes_WHS / To_Be_Moved
+Yulu ETL v2 — Sweep_Raw / Bikes_WHS / To_Be_Moved / Phase 1 Bikes
 Fetches from Metabase (and one external form-response sheet), and writes
 into a master Google Sheet — WITHOUT disturbing any manually-entered
 columns that already live in those tabs.
@@ -16,19 +16,25 @@ KEY DESIGN DIFFERENCE vs. the original script:
   instead of hand-typed, so it works the same way for every new tab
   you add later without needing a new manual column map each time.
 
-Everything below is a clean overwrite (clear + write), never an append.
+Everything below is a clean overwrite (clear + write), never an append,
+EXCEPT Phase 1 Bikes — see process_phase1_bikes() — which keeps the
+existing bike list in column A untouched and only fills in B/C per bike.
 
   *** TODO before running ***
   - Set MASTER_SHEET_ID to the Google Sheet holding Sweep_Raw / Bikes_WHS
-    / To_Be_Moved.
+    / To_Be_Moved / Phase 1 Bikes.
   - Confirm CARD_ID_SWEEP_RAW is the right Metabase card for the raw
     Sweep export (assumed same as the existing Sweep card, 654).
   - Confirm TO_BE_MOVED_SOURCE_GID is the right worksheet gid on the
     external form-response sheet.
+  - Confirm CARD_ID_QC_FLOW (8946, "QC FLOW DATA") is the right card for
+    Phase 1 Bikes, and that PHASE1_QUERY_START_DATE / PHASE1_CUTOFF_DATE
+    are the dates you want.
 """
 
 import io
 import os
+from datetime import date, datetime, timedelta
 
 import pandas as pd
 import requests
@@ -41,7 +47,7 @@ METABASE_URL      = os.environ["METABASE_URL"].rstrip("/")
 METABASE_EMAIL    = os.environ["METABASE_EMAIL"]
 METABASE_PASSWORD = os.environ["METABASE_PASSWORD"]
 
-# Master sheet holding Sweep_Raw / Bikes_WHS / To_Be_Moved
+# Master sheet holding Sweep_Raw / Bikes_WHS / To_Be_Moved / Phase 1 Bikes
 MASTER_SHEET_ID = "1fuCo3fSY0KoW6Y2UQSgtGOBiVIocD_iFEyLdAlOMAr0"
 
 CITY = "BLR"
@@ -53,6 +59,11 @@ CITY = "BLR"
 # Sweep_Raw, matched by name against that tab's header row.
 CARD_ID_SWEEP_RAW = 654
 CARD_ID_WAREHOUSE = 6214
+
+# "QC FLOW DATA" card — one row per QC check, joined to the mechanic
+# repair task it verifies. Used for Phase 1 Bikes (last repair date +
+# whether that repair passed QC post-cutoff).
+CARD_ID_QC_FLOW = 8946
 
 # External Google Form response sheet that feeds "To_Be_Moved"
 # NOTE: you have VIEW-only access to this sheet, and the service account
@@ -66,6 +77,13 @@ TO_BE_MOVED_SOURCE_GID = 1539435491
 TAB_SWEEP_RAW    = "Sweep_Raw"
 TAB_WAREHOUSE    = "Bikes_WHS"
 TAB_TO_BE_MOVED  = "To_Be_Moved"
+TAB_PHASE1_BIKES = "Phase 1 Bikes"
+
+# Phase 1 Bikes: query window for the QC FLOW DATA card (it's date-windowed,
+# so we pull from a fixed start date up to today rather than a single day),
+# and the cutoff date used to decide "Post Phase 1?".
+PHASE1_QUERY_START_DATE = date(2026, 8, 1)
+PHASE1_CUTOFF_DATE      = date(2026, 8, 14)
 
 # ─────────────────────────────────────────────────────────────
 # Expected columns per source (used only to select/clean what we fetch —
@@ -119,6 +137,9 @@ TO_BE_MOVED_COLUMNS = [
     "Column 1", "Remarks",
 ]
 
+# Columns we need out of the QC FLOW DATA card for Phase 1 Bikes
+QC_FLOW_COLUMNS = ["bike_name", "task_date", "Qc pass/fail"]
+
 
 def letter_to_index(letter: str) -> int:
     idx = 0
@@ -165,16 +186,8 @@ def metabase_session() -> dict:
     return {"X-Metabase-Session": resp.json()["id"]}
 
 
-def fetch_metabase_csv(card_id: int, city: str = None) -> pd.DataFrame:
+def fetch_metabase_csv_with_params(card_id: int, parameters: list) -> pd.DataFrame:
     headers = metabase_session()
-
-    parameters = []
-    if city:
-        parameters.append({
-            "type":   "text",
-            "target": ["variable", ["template-tag", "City"]],
-            "value":  city,
-        })
 
     csv_resp = requests.post(
         f"{METABASE_URL}/api/card/{card_id}/query/csv",
@@ -185,8 +198,48 @@ def fetch_metabase_csv(card_id: int, city: str = None) -> pd.DataFrame:
     csv_resp.raise_for_status()
 
     df = pd.read_csv(io.StringIO(csv_resp.text), low_memory=False)
-    print(f"  [Card {card_id}] city={city or 'ALL'} | {len(df)} rows | cols: {df.columns.tolist()}")
+    print(f"  [Card {card_id}] {len(df)} rows | cols: {df.columns.tolist()}")
     return df
+
+
+def fetch_metabase_csv(card_id: int, city: str = None) -> pd.DataFrame:
+    parameters = []
+    if city:
+        parameters.append({
+            "type":   "text",
+            "target": ["variable", ["template-tag", "City"]],
+            "value":  city,
+        })
+    df = fetch_metabase_csv_with_params(card_id, parameters)
+    print(f"  city={city or 'ALL'}")
+    return df
+
+
+def fetch_qc_flow_data(city: str, start_date: date, end_date: date) -> pd.DataFrame:
+    """
+    Card 8946 ("QC FLOW DATA") is a SQL question with {{start_date}},
+    {{end_date}} and {{city}} template tags — it's windowed by date, so
+    we pass the range we actually want (PHASE1_QUERY_START_DATE..today)
+    instead of a single day.
+    """
+    parameters = [
+        {
+            "type":   "date/single",
+            "target": ["variable", ["template-tag", "start_date"]],
+            "value":  start_date.isoformat(),
+        },
+        {
+            "type":   "date/single",
+            "target": ["variable", ["template-tag", "end_date"]],
+            "value":  end_date.isoformat(),
+        },
+        {
+            "type":   "text",
+            "target": ["variable", ["template-tag", "city"]],
+            "value":  city,
+        },
+    ]
+    return fetch_metabase_csv_with_params(CARD_ID_QC_FLOW, parameters)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -213,11 +266,11 @@ def clean_for_sheets(df: pd.DataFrame) -> list:
 
 # ─────────────────────────────────────────────────────────────
 # THE GENERIC "DON'T DISTURB OTHER COLUMNS" WRITER
-# Used for every tab: Sweep_Raw, Bikes_WHS, To_Be_Moved, and any future
-# tab you add. It reads the tab's own header row, matches df columns to
-# it BY NAME, and only clears/writes the matched columns — split into
-# contiguous letter-runs so a gap (e.g. a manual/formula column sitting
-# between two matched columns) is never touched.
+# Used for every tab: Sweep_Raw, Bikes_WHS, To_Be_Moved, Phase 1 Bikes,
+# and any future tab you add. It reads the tab's own header row, matches
+# df columns to it BY NAME, and only clears/writes the matched columns —
+# split into contiguous letter-runs so a gap (e.g. a manual/formula
+# column sitting between two matched columns) is never touched.
 # ─────────────────────────────────────────────────────────────
 def get_header_map(ws) -> dict:
     header = ws.row_values(1)
@@ -322,7 +375,9 @@ def process_warehouse(gc: gspread.Client):
 # STEP C — TO_BE_MOVED
 # Reads the external form-response sheet (by gid, so it survives tab
 # renames) and pushes a clean copy into the To_Be_Moved tab of the
-# master sheet, matched by header name.
+# master sheet, matched by header name. Restricted to CITY (BLR) only —
+# the source form collects entries from every city, but this tab should
+# only ever carry BLR rows.
 # ─────────────────────────────────────────────────────────────
 def fetch_to_be_moved_source(gc: gspread.Client) -> pd.DataFrame:
     """
@@ -395,6 +450,14 @@ def fetch_to_be_moved_source(gc: gspread.Client) -> pd.DataFrame:
     # Drop fully-blank rows (e.g. trailing empty form rows)
     df = df[~(df.astype(str).apply(lambda r: r.str.strip()).eq("").all(axis=1))]
 
+    # Only BLR belongs in this tab — the form collects every city.
+    if "City" in df.columns:
+        before = len(df)
+        df = df[df["City"].astype(str).str.strip().str.upper() == CITY]
+        print(f"  To_Be_Moved source: filtered to city={CITY} ({len(df)}/{before} rows kept).")
+    else:
+        print("  NOTE: source sheet has no 'City' column — could not filter by city.")
+
     print(f"  To_Be_Moved source: {len(df)} rows fetched.")
     return df
 
@@ -403,6 +466,79 @@ def process_to_be_moved(gc: gspread.Client):
     print("\n── STEP C: To_Be_Moved ──")
     df = fetch_to_be_moved_source(gc)
     update_named_columns_auto(gc, MASTER_SHEET_ID, TAB_TO_BE_MOVED, df)
+
+
+# ─────────────────────────────────────────────────────────────
+# STEP D — PHASE 1 BIKES
+# This tab is different from the others: column A (bike number) is
+# populated BY HAND and its row order must be preserved — we never
+# clear/rewrite it. For each bike already listed there, we look up its
+# most recent QC-passed repair (from card 8946, "QC FLOW DATA") and fill
+# in:
+#   B: Last Repair Date  — task_date of that bike's latest PASSED QC check
+#   C: Post Phase 1?     — "Yes" if that date is after PHASE1_CUTOFF_DATE,
+#                           "No" if it's on/before it, blank if the bike
+#                           has no passed QC check in the query window.
+# Rows/columns are matched to the existing bike list by position (row 2
+# in the sheet = bike_numbers[0], etc.), same as the header-matched
+# writer used everywhere else — but the *data to write* is computed per
+# bike first, here, rather than being the fetched rows verbatim.
+# ─────────────────────────────────────────────────────────────
+def process_phase1_bikes(gc: gspread.Client):
+    print("\n── STEP D: Phase 1 Bikes ──")
+    ws = gc.open_by_key(MASTER_SHEET_ID).worksheet(TAB_PHASE1_BIKES)
+
+    bike_numbers = ws.col_values(1)[1:]  # skip header row
+    bike_numbers = [b.strip() for b in bike_numbers]
+    if not any(bike_numbers):
+        print(f"  '{TAB_PHASE1_BIKES}' → no bikes listed in column A, skipping.")
+        return
+
+    df = fetch_qc_flow_data(CITY, PHASE1_QUERY_START_DATE, date.today())
+
+    missing = [c for c in QC_FLOW_COLUMNS if c not in df.columns]
+    if missing:
+        print(f"  NOTE: card {CARD_ID_QC_FLOW} is missing expected columns: {missing}")
+        return
+    df = df[QC_FLOW_COLUMNS].copy()
+
+    df["bike_name"] = normalise_bike_id(df["bike_name"])
+    df["task_date"] = pd.to_datetime(df["task_date"], errors="coerce")
+    df = df.dropna(subset=["task_date"])
+
+    # Only PASSED QC checks count as "the" repair — a bike whose latest
+    # attempt failed QC shows its last PASSING repair instead, per your
+    # call.
+    passed = df[df["Qc pass/fail"].astype(str).str.strip().str.lower() == "pass"]
+
+    # Most recent passed repair per bike.
+    last_pass = (
+        passed.sort_values("task_date")
+              .groupby("bike_name", as_index=True)
+              .tail(1)
+              .set_index("bike_name")["task_date"]
+    )
+
+    rows = []
+    matched = 0
+    for bike in bike_numbers:
+        bike_norm = normalise_bike_id(pd.Series([bike])).iloc[0]
+        last_date = last_pass.get(bike_norm)
+        if pd.isna(last_date) or last_date is None:
+            rows.append({"Last Repair Date": "", "Post Phase 1?": ""})
+            continue
+        matched += 1
+        last_date = last_date.date()
+        rows.append({
+            "Last Repair Date": last_date.strftime("%Y-%m-%d"),
+            "Post Phase 1?": "Yes" if last_date > PHASE1_CUTOFF_DATE else "No",
+        })
+
+    print(f"  '{TAB_PHASE1_BIKES}' → matched {matched}/{len(bike_numbers)} bikes to a "
+          f"passed QC check between {PHASE1_QUERY_START_DATE} and {date.today()}.")
+
+    out_df = pd.DataFrame(rows)
+    update_named_columns_auto(gc, MASTER_SHEET_ID, TAB_PHASE1_BIKES, out_df)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -415,6 +551,7 @@ def main():
     process_sweep_raw(gc)
     process_warehouse(gc)
     process_to_be_moved(gc)
+    process_phase1_bikes(gc)
 
     print("\n✅ ETL complete.")
 
