@@ -212,25 +212,26 @@ def fetch_metabase_csv_with_params(card_id: int, parameters: list) -> pd.DataFra
     return df
 
 
-def fetch_metabase_csv(card_id: int, city: str = None) -> pd.DataFrame:
-    parameters = []
-    if city:
-        parameters.append({
-            "type":   "text",
-            "target": ["variable", ["template-tag", "City"]],
-            "value":  city,
-        })
-    df = fetch_metabase_csv_with_params(card_id, parameters)
-    print(f"  city={city or 'ALL'}")
+def fetch_metabase_csv(card_id: int) -> pd.DataFrame:
+    # NOTE: we deliberately never pass a city parameter to Metabase here.
+    # Card 6214 (Bikes_WHS) throws an Athena "incorrect number of
+    # parameters" error as soon as ANY optional filter (city/cluster/
+    # bike_name) is supplied — a quirk of how that question's SQL is
+    # structured, not something we can safely paper over per-card. So we
+    # always fetch the full, unfiltered result and filter by city
+    # ourselves in pandas afterwards (every call site already does this).
+    df = fetch_metabase_csv_with_params(card_id, [])
     return df
 
 
-def fetch_qc_flow_data(city: str, start_date: date, end_date: date) -> pd.DataFrame:
+def fetch_qc_flow_data(start_date: date, end_date: date) -> pd.DataFrame:
     """
-    Card 8946 ("QC FLOW DATA") is a SQL question with {{start_date}},
-    {{end_date}} and {{city}} template tags — it's windowed by date, so
-    we pass the range we actually want (PHASE1_QUERY_START_DATE..today)
-    instead of a single day.
+    Card 8946 ("QC FLOW DATA") is a SQL question with {{start_date}} and
+    {{end_date}} template tags — it's windowed by date, so we pass the
+    range we actually want (PHASE1_QUERY_START_DATE..today) instead of a
+    single day. City is intentionally NOT passed as a Metabase parameter
+    (same Athena param-count risk as Bikes_WHS) — we fetch every city in
+    the date window and filter to CITY ourselves in pandas.
     """
     parameters = [
         {
@@ -242,11 +243,6 @@ def fetch_qc_flow_data(city: str, start_date: date, end_date: date) -> pd.DataFr
             "type":   "date/single",
             "target": ["variable", ["template-tag", "end_date"]],
             "value":  end_date.isoformat(),
-        },
-        {
-            "type":   "text",
-            "target": ["variable", ["template-tag", "city"]],
-            "value":  city,
         },
     ]
     return fetch_metabase_csv_with_params(CARD_ID_QC_FLOW, parameters)
@@ -345,7 +341,7 @@ def update_named_columns_auto(gc: gspread.Client, sheet_id: str, tab: str, df: p
 # ─────────────────────────────────────────────────────────────
 def process_sweep_raw(gc: gspread.Client):
     print("\n── STEP A: Sweep_Raw ──")
-    df = fetch_metabase_csv(CARD_ID_SWEEP_RAW, city=CITY)
+    df = fetch_metabase_csv(CARD_ID_SWEEP_RAW)
 
     if "bike" in df.columns:
         df["bike"] = normalise_bike_id(df["bike"])
@@ -367,7 +363,7 @@ def process_sweep_raw(gc: gspread.Client):
 # ─────────────────────────────────────────────────────────────
 def process_warehouse(gc: gspread.Client):
     print("\n── STEP B: Bikes_WHS ──")
-    df = fetch_metabase_csv(CARD_ID_WAREHOUSE, city=CITY)
+    df = fetch_metabase_csv(CARD_ID_WAREHOUSE)
 
     if "city" in df.columns:
         df = df[df["city"] == CITY]
@@ -504,7 +500,14 @@ def process_phase1_bikes(gc: gspread.Client):
         print(f"  '{TAB_PHASE1_BIKES}' → no bikes listed in column A, skipping.")
         return
 
-    df = fetch_qc_flow_data(CITY, PHASE1_QUERY_START_DATE, date.today())
+    df = fetch_qc_flow_data(PHASE1_QUERY_START_DATE, date.today())
+
+    if "city" in df.columns:
+        before = len(df)
+        df = df[df["city"].astype(str).str.strip().str.upper() == CITY]
+        print(f"  '{TAB_PHASE1_BIKES}' → filtered to city={CITY} ({len(df)}/{before} rows kept).")
+    else:
+        print(f"  NOTE: card {CARD_ID_QC_FLOW} has no 'city' column — could not filter by city.")
 
     missing = [c for c in QC_FLOW_COLUMNS if c not in df.columns]
     if missing:
