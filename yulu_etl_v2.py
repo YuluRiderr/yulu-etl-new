@@ -381,9 +381,9 @@ def process_warehouse(gc: gspread.Client):
 # STEP C — TO_BE_MOVED
 # Reads the external form-response sheet (by gid, so it survives tab
 # renames) and pushes a clean copy into the To_Be_Moved tab of the
-# master sheet, matched by header name. Restricted to CITY (BLR) only —
-# the source form collects entries from every city, but this tab should
-# only ever carry BLR rows.
+# master sheet, matched by header name. NOT filtered by city — the form
+# collects entries from every city, and this tab is meant to carry all
+# of them, every run.
 # ─────────────────────────────────────────────────────────────
 def fetch_to_be_moved_source(gc: gspread.Client) -> pd.DataFrame:
     """
@@ -456,14 +456,8 @@ def fetch_to_be_moved_source(gc: gspread.Client) -> pd.DataFrame:
     # Drop fully-blank rows (e.g. trailing empty form rows)
     df = df[~(df.astype(str).apply(lambda r: r.str.strip()).eq("").all(axis=1))]
 
-    # Only BLR belongs in this tab — the form collects every city.
-    if "City" in df.columns:
-        before = len(df)
-        df = df[df["City"].astype(str).str.strip().str.upper() == CITY]
-        print(f"  To_Be_Moved source: filtered to city={CITY} ({len(df)}/{before} rows kept).")
-    else:
-        print("  NOTE: source sheet has no 'City' column — could not filter by city.")
-
+    # Intentionally NOT filtered by city — every run should carry every
+    # city's entries from the source form, not just CITY (BLR).
     print(f"  To_Be_Moved source: {len(df)} rows fetched.")
     return df
 
